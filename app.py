@@ -2,9 +2,9 @@ import os
 import re
 import json
 import asyncio
+from datetime import datetime, timedelta
 from nicegui import ui, app
 from playwright.async_api import async_playwright
-import webbrowser
 
 # Data structure extracted from the HTML provided by user
 ARXIV_DATA = {
@@ -206,53 +206,67 @@ class ArXivDownloader:
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
 
-    async def fetch_papers(self, subject, date, include_abs):
+    async def fetch_papers(self, subject, start_date, include_abs):
         self.is_loading = True
-        ui.notify(f"Fetching papers for {subject} on {date}...")
+        ui.notify(f"Fetching papers for {subject} since {start_date}...")
         self.results = []
         
         async with async_playwright() as p:
-            # Use chrome channel as requested for company environments
             browser = await p.chromium.launch(channel="chrome", headless=True)
             context = await browser.new_context()
             page = await context.new_page()
             
-            url = f"https://arxiv.org/catchup?subject={subject}&date={date}"
+            url = f"https://arxiv.org/catchup?subject={subject}&date={start_date}"
             if include_abs:
                 url += "&include_abs=True"
             
             print(f"Navigating to {url}")
             await page.goto(url)
             
-            # Simple parsing of the results page
-            # ArXiv results are usually in <dl> with <dt> containing the link and <dd> the metadata
-            papers = await page.query_selector_all("dl > dt")
-            for dt in papers:
-                # Find the PDF link
-                pdf_link_el = await dt.query_selector('a[title="Download PDF"]')
-                if not pdf_link_el:
+            try:
+                await page.wait_for_selector("dl", timeout=15000)
+            except:
+                self.is_loading = False
+                ui.notify("No papers found or page timed out.", type="warning")
+                await browser.close()
+                return
+
+            # Parsing headers and papers
+            # We look for H3 (dates) and DT (papers)
+            elements = await page.query_selector_all("h2, h3, dl > dt")
+            current_date_str = "Recent Submissions"
+            
+            for el in elements:
+                tag = await el.evaluate("el => el.tagName")
+                if tag in ["H2", "H3"]:
+                    text = await el.inner_text()
+                    current_date_str = text.strip()
                     continue
                 
-                pdf_url = await pdf_link_el.get_attribute("href")
-                if not pdf_url.startswith("http"):
-                    pdf_url = "https://arxiv.org" + pdf_url
-                
-                # Get ID
-                paper_id_el = await dt.query_selector('a[id^="pdf-"]')
-                paper_id = await paper_id_el.inner_text() if paper_id_el else "Unknown"
-                
-                # Get Title (usually in the following <dd>)
-                dd = await page.evaluate_handle("el => el.nextElementSibling", dt)
-                title_el = await dd.query_selector(".list-title")
-                title = await title_el.inner_text() if title_el else "No Title"
-                title = title.replace("Title: ", "").strip()
-                
-                self.results.append({
-                    "id": paper_id,
-                    "title": title,
-                    "pdf_url": pdf_url,
-                    "selected": False
-                })
+                if tag == "DT":
+                    pdf_link_el = await el.query_selector('a[title="Download PDF"]')
+                    if not pdf_link_el:
+                        continue
+                    
+                    pdf_url = await pdf_link_el.get_attribute("href")
+                    if not pdf_url.startswith("http"):
+                        pdf_url = "https://arxiv.org" + pdf_url
+                    
+                    paper_id_el = await el.query_selector('a[id^="pdf-"]')
+                    paper_id = await paper_id_el.inner_text() if paper_id_el else "Unknown"
+                    
+                    dd = await page.evaluate_handle("el => el.nextElementSibling", el)
+                    title_el = await dd.query_selector(".list-title")
+                    title = await title_el.inner_text() if title_el else "No Title"
+                    title = title.replace("Title: ", "").strip()
+                    
+                    self.results.append({
+                        "id": paper_id,
+                        "title": title,
+                        "pdf_url": pdf_url,
+                        "date": current_date_str,
+                        "selected": False
+                    })
             
             await browser.close()
         
@@ -262,24 +276,37 @@ class ArXivDownloader:
         else:
             ui.notify(f"Found {len(self.results)} papers.")
 
-    async def download_paper(self, paper):
+    async def download_papers(self, papers):
+        if not papers:
+            ui.notify("No papers selected", type="warning")
+            return
+            
+        ui.notify(f"Starting download of {len(papers)} papers...")
+        
         async with async_playwright() as p:
             browser = await p.chromium.launch(channel="chrome", headless=True)
-            page = await browser.new_page()
+            context = await browser.new_context()
             
-            filename = f"{paper['id'].replace(':', '_')}.pdf"
-            filepath = os.path.join(self.download_dir, filename)
+            for paper in papers:
+                filename = f"{paper['id'].replace(':', '_')}.pdf"
+                filepath = os.path.join(self.download_dir, filename)
+                
+                print(f"Downloading {paper['id']}...")
+                try:
+                    response = await context.request.get(paper['pdf_url'], timeout=30000)
+                    if response.status == 200:
+                        with open(filepath, "wb") as f:
+                            f.write(await response.body())
+                        ui.notify(f"Downloaded {paper['id']}", type="positive")
+                    else:
+                        ui.notify(f"Failed to download {paper['id']} (Status {response.status})", type="negative")
+                except Exception as e:
+                    ui.notify(f"Error downloading {paper['id']}: {str(e)}", type="negative")
+                
+                await asyncio.sleep(0.5)
             
-            ui.notify(f"Downloading {paper['id']}...")
-            
-            # Playwright handles downloads
-            async with page.expect_download() as download_info:
-                await page.goto(paper['pdf_url'])
-            
-            download = await download_info.value
-            await download.save_as(filepath)
             await browser.close()
-            ui.notify(f"Downloaded to {filepath}", type="positive")
+        ui.notify("Bulk download completed.")
 
 downloader = ArXivDownloader()
 
@@ -287,15 +314,16 @@ downloader = ArXivDownloader()
 def main_page():
     ui.colors(primary='#1a237e', secondary='#303f9f', accent='#ff4081')
     
-    with ui.header().classes('items-center justify-between'):
+    with ui.header().classes('items-center justify-between shadow-md px-6 py-2 bg-indigo-900 text-white'):
         ui.label('ArXiv Catchup Downloader').classes('text-2xl font-bold')
-        ui.button(icon='settings', on_click=lambda: ui.notify('Settings not implemented')).flat()
+        ui.button(icon='settings', on_click=lambda: ui.notify('Settings not implemented')).props('flat color=white')
 
-    with ui.column().classes('w-full p-8 max-w-4xl mx-auto'):
-        with ui.card().classes('w-full p-6 shadow-lg'):
-            ui.label('Search Criteria').classes('text-xl font-semibold mb-4')
+    with ui.column().classes('w-full p-8 max-w-5xl mx-auto'):
+        # Selection Card
+        with ui.card().classes('w-full p-8 shadow-2xl rounded-2xl bg-white'):
+            ui.label('Search Criteria').classes('text-2xl font-bold mb-6 text-indigo-900')
             
-            with ui.row().classes('w-full gap-4'):
+            with ui.row().classes('w-full gap-6'):
                 group_select = ui.select(
                     {k: v['label'] for k, v in ARXIV_DATA.items()},
                     label='Group',
@@ -313,20 +341,40 @@ def main_page():
                     label='Category (Optional)'
                 ).classes('flex-1')
 
-            with ui.row().classes('w-full gap-4 items-end mt-4'):
-                date_input = ui.date(value='2026-05-14').classes('hidden')
-                with ui.button(icon='event'):
-                    ui.menu().props('no-parent-event')
-                    ui.date().bind_value(date_input)
+            with ui.row().classes('w-full gap-6 items-end mt-8'):
+                with ui.column().classes('flex-1'):
+                    ui.label('Start Date').classes('text-sm font-medium text-slate-600 mb-1')
+                    with ui.input(value='2026-05-13') as start_date:
+                        with ui.menu().props('no-parent-event') as menu:
+                            ui.date().bind_value(start_date)
+                        with start_date.add_slot('append'):
+                            ui.icon('calendar_month').on('click', menu.open).classes('cursor-pointer text-indigo-600')
+
+                with ui.column().classes('flex-1'):
+                    ui.label('End Date (UI Range)').classes('text-sm font-medium text-slate-600 mb-1')
+                    with ui.input(value='2026-05-14') as end_date:
+                        with ui.menu().props('no-parent-event') as menu2:
+                            ui.date().bind_value(end_date)
+                        with end_date.add_slot('append'):
+                            ui.icon('calendar_today').on('click', menu2.open).classes('cursor-pointer text-indigo-600')
                 
-                ui.label().bind_text_from(date_input, 'value', backward=lambda v: f"Date: {v}")
+                include_abs = ui.checkbox('Include Abstracts', value=True).classes('mb-2 text-slate-700')
                 
-                include_abs = ui.checkbox('Include Abstracts', value=True)
-                
-                ui.button('Fetch Papers', on_click=lambda: start_fetch()).classes('ml-auto px-8')
+                ui.button('Fetch Papers', on_click=lambda: start_fetch()).classes('px-12 h-14 rounded-xl bg-indigo-700 text-white font-bold shadow-lg hover:bg-indigo-800 transition-all')
+
+        # Global Action Bar (always present but buttons only show when results exist)
+        action_bar_container = ui.row().classes('w-full mt-10 items-center justify-between p-4 bg-slate-100 rounded-xl shadow-inner')
+        action_bar_container.visible = False # Start hidden
+        
+        with action_bar_container:
+            with ui.row().classes('gap-4'):
+                ui.button('Select All', on_click=lambda: set_all_selected(True)).props('outline color=indigo').classes('rounded-lg')
+                ui.button('Deselect All', on_click=lambda: set_all_selected(False)).props('outline color=grey').classes('rounded-lg')
+            
+            ui.button('Download Selected', on_click=lambda: download_selected()).classes('bg-green-600 text-white px-8 py-3 rounded-xl font-bold shadow-lg hover:bg-green-700 transition-transform active:scale-95')
 
         # Results area
-        results_container = ui.column().classes('w-full mt-8')
+        results_container = ui.column().classes('w-full mt-6 gap-6')
 
     def update_archives(group_id):
         archives = ARXIV_DATA[group_id]['archives']
@@ -349,24 +397,51 @@ def main_page():
             ui.notify("Please select at least a Group and Archive", type="negative")
             return
         
-        await downloader.fetch_papers(subject, date_input.value, include_abs.value)
+        await downloader.fetch_papers(subject, start_date.value, include_abs.value)
         refresh_results()
+
+    def set_all_selected(value):
+        for paper in downloader.results:
+            paper['selected'] = value
+        refresh_results()
+
+    async def download_selected():
+        selected = [p for p in downloader.results if p['selected']]
+        if not selected:
+            ui.notify("No papers selected", type="warning")
+            return
+        await downloader.download_papers(selected)
 
     def refresh_results():
         results_container.clear()
         if not downloader.results:
+            action_bar_container.visible = False
             return
         
+        action_bar_container.visible = True
+        
+        # Group results by date for better UI
+        by_date = {}
+        for paper in downloader.results:
+            d = paper['date']
+            if d not in by_date:
+                by_date[d] = []
+            by_date[d].append(paper)
+
         with results_container:
-            ui.label(f"Results ({len(downloader.results)})").classes('text-xl font-semibold mb-4')
-            for paper in downloader.results:
-                with ui.card().classes('w-full mb-2 p-4 hover:bg-slate-50 transition-colors'):
-                    with ui.row().classes('w-full items-center justify-between'):
-                        with ui.column().classes('flex-1'):
-                            ui.label(paper['id']).classes('text-sm font-mono text-blue-600')
-                            ui.label(paper['title']).classes('text-lg font-medium')
-                        
-                        ui.button('Download', on_click=lambda p=paper: downloader.download_paper(p)).props('outline')
+            for date_str, papers in by_date.items():
+                with ui.column().classes('w-full'):
+                    ui.label(date_str).classes('text-xl font-extrabold text-indigo-900 mt-6 border-b-4 border-indigo-200 w-full pb-2 px-2')
+                    for paper in papers:
+                        with ui.card().classes('w-full p-5 hover:shadow-xl transition-all border-l-8 border-indigo-400 bg-white rounded-lg'):
+                            with ui.row().classes('w-full items-center gap-6 no-wrap'):
+                                ui.checkbox().bind_value(paper, 'selected').classes('scale-150 ml-2')
+                                with ui.column().classes('flex-1 min-w-0'):
+                                    ui.label(paper['id']).classes('text-sm font-mono text-indigo-600 font-bold mb-1')
+                                    ui.label(paper['title']).classes('text-xl font-semibold leading-snug text-slate-800 break-words')
+                                
+                                with ui.row().classes('items-center gap-2'):
+                                    ui.button(icon='download', on_click=lambda p=paper: downloader.download_papers([p])).props('flat round color=green size=lg')
 
     # Initialize selects
     group_select.value = 'grp_cs'
